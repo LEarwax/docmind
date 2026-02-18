@@ -24,27 +24,6 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
-
-
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
-
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast = Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast");
-
 app.MapGet("/ping", () => "backend alive");
 
 app.MapPost("/upload", async (HttpRequest request) =>
@@ -57,20 +36,61 @@ app.MapPost("/upload", async (HttpRequest request) =>
     if (file == null)
         return Results.BadRequest("No file");
 
+    // Save uploaded file locally
     Directory.CreateDirectory("uploads");
     var safeName = Path.GetFileName(file.FileName);
-    var path = Path.Combine("uploads", safeName);
+    var savedPath = Path.Combine("uploads", $"{Guid.NewGuid()}_{safeName}");
 
-    await using var stream = File.Create(path);
-    await file.CopyToAsync(stream);
+    await using (var stream = File.Create(savedPath))
+        await file.CopyToAsync(stream);
 
-    return Results.Ok(new { message = "uploaded", filename = safeName });
+    // Extract text
+    string text;
+    try
+    {
+        await using var fs = File.OpenRead(savedPath);
+        var diskFile = new FormFile(fs, 0, fs.Length, "file", safeName)
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = file.ContentType
+        };
+
+        text = await DocPipeline.ExtractTextAsync(diskFile);
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest($"Text extraction failed: {ex.Message}");
+    }
+
+    // Chunk
+    var chunks = DocPipeline.ChunkText(text);
+
+    // Store in memory
+    var docId = Guid.NewGuid().ToString("N");
+    DocPipeline.Docs[docId] = new StoredDoc(safeName, text, chunks);
+
+    return Results.Ok(new
+    {
+        message = "uploaded",
+        docId,
+        filename = safeName,
+        charCount = text.Length,
+        chunkCount = chunks.Count
+    });
 });
 
+app.MapGet("/docs/{docId}/chunks", (string docId) =>
+{
+    if (!DocPipeline.Docs.TryGetValue(docId, out var doc))
+        return Results.NotFound("Unknown docId");
+
+    return Results.Ok(new
+    {
+        docId,
+        filename = doc.FileName,
+        chunkCount = doc.Chunks.Count,
+        chunks = doc.Chunks.Take(50).Select((c, i) => new { index = i, text = c })
+    });
+});
 
 app.Run();
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}

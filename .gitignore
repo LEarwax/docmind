@@ -1,0 +1,15 @@
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+
+# .NET
+backend/bin/
+backend/obj/
+
+# Local uploads / temp files
+backend/uploads/
+
+# OS
+.DS_Store
