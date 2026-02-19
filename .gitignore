@@ -1,4 +1,5 @@
 # Node
+DS_Store
 frontend/node_modules/
 frontend/.next/
 frontend/out/
@@ -7,6 +8,7 @@ frontend/.env.local
 # .NET
 backend/bin/
 backend/obj/
+docmind-clean.sln
 
 # Local uploads / temp files
 backend/uploads/
