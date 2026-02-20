@@ -9,6 +9,7 @@ frontend/.env.local
 backend/bin/
 backend/obj/
 docmind-clean.sln
+backend/appsettings.Development.json
 
 # Local uploads / temp files
 backend/uploads/

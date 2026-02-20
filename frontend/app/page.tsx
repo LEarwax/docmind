@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_BASE;
+const API = process.env.NEXT_PUBLIC_API_BASE_URL;
 
 type Chunk = { index: number; text: string };
 

@@ -1,5 +1,10 @@
+using backend.Models;
+using backend.Services;
+using Microsoft.AspNetCore.Http;
+
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.AddHttpClient<OpenAIEmbeddingsClient>();
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
@@ -10,15 +15,13 @@ builder.Services.AddCors(options =>
     });
 });
 
-// Add services to the container.
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
+// OpenAPI (optional)
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
 
 app.UseCors();
 
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
@@ -26,7 +29,7 @@ if (app.Environment.IsDevelopment())
 
 app.MapGet("/ping", () => "backend alive");
 
-app.MapPost("/upload", async (HttpRequest request) =>
+app.MapPost("/upload", async (HttpRequest request, OpenAIEmbeddingsClient embeddingsClient) =>
 {
     if (!request.HasFormContentType)
         return Results.BadRequest("Expected form");
@@ -37,9 +40,11 @@ app.MapPost("/upload", async (HttpRequest request) =>
         return Results.BadRequest("No file");
 
     // Save uploaded file locally
-    Directory.CreateDirectory("uploads");
+    var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "uploads");
+    Directory.CreateDirectory(uploadsDir);
+
     var safeName = Path.GetFileName(file.FileName);
-    var savedPath = Path.Combine("uploads", $"{Guid.NewGuid()}_{safeName}");
+    var savedPath = Path.Combine(uploadsDir, $"{Guid.NewGuid()}_{safeName}");
 
     await using (var stream = File.Create(savedPath))
         await file.CopyToAsync(stream);
@@ -64,10 +69,17 @@ app.MapPost("/upload", async (HttpRequest request) =>
 
     // Chunk
     var chunks = DocPipeline.ChunkText(text);
+    if (chunks.Count == 0)
+        return Results.BadRequest("No extractable text found.");
+
+    // Embed
+    var vectors = new List<float[]>(chunks.Count);
+    foreach (var c in chunks)
+        vectors.Add(await embeddingsClient.EmbedAsync(c));
 
     // Store in memory
     var docId = Guid.NewGuid().ToString("N");
-    DocPipeline.Docs[docId] = new StoredDoc(safeName, text, chunks);
+    DocPipeline.Docs[docId] = new StoredDoc(safeName, text, chunks, vectors);
 
     return Results.Ok(new
     {
@@ -75,8 +87,29 @@ app.MapPost("/upload", async (HttpRequest request) =>
         docId,
         filename = safeName,
         charCount = text.Length,
-        chunkCount = chunks.Count
+        chunkCount = chunks.Count,
+        embeddingCount = vectors.Count
     });
+});
+
+app.MapPost("/docs/{docId}/search", async (
+    string docId,
+    SearchRequest req,
+    OpenAIEmbeddingsClient embeddingsClient) =>
+{
+    if (!DocPipeline.Docs.TryGetValue(docId, out var doc))
+        return Results.NotFound("Unknown docId");
+
+    var qVec = await embeddingsClient.EmbedAsync(req.Query);
+
+    var top = doc.Embeddings
+        .Select((vec, i) => new { i, score = DocPipeline.CosineSimilarity(qVec, vec) })
+        .OrderByDescending(x => x.score)
+        .Take(5)
+        .Select(x => new { chunkIndex = x.i, score = x.score, text = doc.Chunks[x.i] })
+        .ToList();
+
+    return Results.Ok(top);
 });
 
 app.MapGet("/docs/{docId}/chunks", (string docId) =>
