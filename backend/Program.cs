@@ -1,10 +1,11 @@
 using backend.Models;
 using backend.Services;
-using Microsoft.AspNetCore.Http;
+
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddHttpClient<OpenAIEmbeddingsClient>();
+builder.Services.AddHttpClient<OpenAIResponsesClient>();
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
@@ -73,9 +74,7 @@ app.MapPost("/upload", async (HttpRequest request, OpenAIEmbeddingsClient embedd
         return Results.BadRequest("No extractable text found.");
 
     // Embed
-    var vectors = new List<float[]>(chunks.Count);
-    foreach (var c in chunks)
-        vectors.Add(await embeddingsClient.EmbedAsync(c));
+    var vectors = await embeddingsClient.EmbedManyAsync(chunks);
 
     // Store in memory
     var docId = Guid.NewGuid().ToString("N");
@@ -123,6 +122,56 @@ app.MapGet("/docs/{docId}/chunks", (string docId) =>
         filename = doc.FileName,
         chunkCount = doc.Chunks.Count,
         chunks = doc.Chunks.Take(50).Select((c, i) => new { index = i, text = c })
+    });
+});
+
+app.MapPost("/docs/{docId}/ask", async (
+    string docId,
+    AskRequest req,
+    OpenAIEmbeddingsClient embeddingsClient,
+    OpenAIResponsesClient responsesClient) =>
+{
+    if (!DocPipeline.Docs.TryGetValue(docId, out var doc))
+        return Results.NotFound("Unknown docId");
+
+    var topK = Math.Clamp(req.TopK, 1, 10);
+
+    // Retrieve
+    var qVec = await embeddingsClient.EmbedAsync(req.Question);
+
+    var top = doc.Embeddings
+        .Select((vec, i) => new { i, score = DocPipeline.CosineSimilarity(qVec, vec) })
+        .OrderByDescending(x => x.score)
+        .Take(topK)
+        .ToList();
+
+    var context = string.Join("\n\n", top.Select(t =>
+        $"[Chunk {t.i} | score {t.score:F3}]\n{doc.Chunks[t.i]}"));
+
+    // Generate (grounded)
+    var system = """
+You are DocMind, a document-grounded assistant.
+Answer ONLY using the provided context.
+If the answer is not in the context, say: "I don't know based on this document."
+When you use facts, cite chunk numbers like [Chunk 0].
+Be concise.
+""";
+
+    var user = $"""
+Question: {req.Question}
+
+Context:
+{context}
+""";
+
+    var answer = await responsesClient.GenerateAsync(system, user);
+
+    return Results.Ok(new
+    {
+        docId,
+        question = req.Question,
+        topChunks = top.Select(t => new { chunkIndex = t.i, score = t.score }),
+        answer
     });
 });
 
