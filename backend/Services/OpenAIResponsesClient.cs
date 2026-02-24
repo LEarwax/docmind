@@ -19,11 +19,11 @@ public class OpenAIResponsesClient
     {
         var body = new
         {
-            model = "gpt-4.1",
+            model = "gpt-4.1-mini",
             input = new object[]
             {
-                new { type = "message", role = "system", content = system },
-                new { type = "message", role = "user", content = user }
+                new { role = "system", content = system },
+                new { role = "user", content = user }
             }
         };
 

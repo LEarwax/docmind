@@ -1,6 +1,9 @@
 using backend.Models;
 using backend.Services;
-
+using backend.Data;
+using backend.Data.Entities;
+using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,10 +19,24 @@ builder.Services.AddCors(options =>
     });
 });
 
+builder.Services.AddDbContext<DocMindDbContext>(opt =>
+{
+    var cs = builder.Configuration.GetConnectionString("DocMind");
+    opt.UseSqlite(cs);
+});
+
+builder.Services.AddScoped<IDocRepository, SqliteDocRepository>();
+
 // OpenAPI (optional)
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
+
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<DocMindDbContext>();
+    db.Database.EnsureCreated();
+}
 
 app.UseCors();
 
@@ -30,25 +47,27 @@ if (app.Environment.IsDevelopment())
 
 app.MapGet("/ping", () => "backend alive");
 
-app.MapPost("/upload", async (HttpRequest request, OpenAIEmbeddingsClient embeddingsClient) =>
+app.MapPost("/upload", async (
+    HttpRequest request,
+    OpenAIEmbeddingsClient embeddingsClient,
+    IDocRepository repo,
+    CancellationToken ct) =>
 {
     if (!request.HasFormContentType)
         return Results.BadRequest("Expected form");
 
-    var form = await request.ReadFormAsync();
+    var form = await request.ReadFormAsync(ct);
     var file = form.Files["file"];
     if (file == null)
         return Results.BadRequest("No file");
 
-    // Save uploaded file locally
-    var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "uploads");
-    Directory.CreateDirectory(uploadsDir);
-
+    // Save uploaded file locally (optional but fine for now)
+    Directory.CreateDirectory("uploads");
     var safeName = Path.GetFileName(file.FileName);
-    var savedPath = Path.Combine(uploadsDir, $"{Guid.NewGuid()}_{safeName}");
+    var savedPath = Path.Combine("uploads", $"{Guid.NewGuid()}_{safeName}");
 
     await using (var stream = File.Create(savedPath))
-        await file.CopyToAsync(stream);
+        await file.CopyToAsync(stream, ct);
 
     // Extract text
     string text;
@@ -68,17 +87,37 @@ app.MapPost("/upload", async (HttpRequest request, OpenAIEmbeddingsClient embedd
         return Results.BadRequest($"Text extraction failed: {ex.Message}");
     }
 
-    // Chunk
+    // Chunk text
     var chunks = DocPipeline.ChunkText(text);
-    if (chunks.Count == 0)
-        return Results.BadRequest("No extractable text found.");
 
-    // Embed
-    var vectors = await embeddingsClient.EmbedManyAsync(chunks);
+    // Generate embeddings
+    var vectors = new List<float[]>(chunks.Count);
+    foreach (var c in chunks)
+    {
+        var vec = await embeddingsClient.EmbedAsync(c, ct);
+        vectors.Add(vec);
+    }
 
-    // Store in memory
+    // Create document entity
     var docId = Guid.NewGuid().ToString("N");
-    DocPipeline.Docs[docId] = new StoredDoc(safeName, text, chunks, vectors);
+
+    var doc = new DocumentEntity
+    {
+        Id = docId,
+        FileName = safeName,
+        FullText = text,
+        CreatedUtc = DateTime.UtcNow,
+        Chunks = chunks.Select((chunkText, idx) => new ChunkEntity
+        {
+            DocumentId = docId,
+            ChunkIndex = idx,
+            Text = chunkText,
+            EmbeddingJson = JsonSerializer.Serialize(vectors[idx])
+        }).ToList()
+    };
+
+    // Save to SQLite
+    await repo.SaveDocumentAsync(doc, ct);
 
     return Results.Ok(new
     {
@@ -86,42 +125,52 @@ app.MapPost("/upload", async (HttpRequest request, OpenAIEmbeddingsClient embedd
         docId,
         filename = safeName,
         charCount = text.Length,
-        chunkCount = chunks.Count,
-        embeddingCount = vectors.Count
+        chunkCount = chunks.Count
     });
 });
+
 
 app.MapPost("/docs/{docId}/search", async (
     string docId,
     SearchRequest req,
-    OpenAIEmbeddingsClient embeddingsClient) =>
+    OpenAIEmbeddingsClient embeddingsClient,
+    IDocRepository repo,
+    CancellationToken ct) =>
 {
-    if (!DocPipeline.Docs.TryGetValue(docId, out var doc))
-        return Results.NotFound("Unknown docId");
+    var doc = await repo.GetDocumentWithChunksAsync(docId, ct);
+    if (doc == null) return Results.NotFound("Unknown docId");
 
-    var qVec = await embeddingsClient.EmbedAsync(req.Query);
+    var qVec = await embeddingsClient.EmbedAsync(req.Query, ct);
 
-    var top = doc.Embeddings
-        .Select((vec, i) => new { i, score = DocPipeline.CosineSimilarity(qVec, vec) })
+    var chunks = doc.Chunks.OrderBy(c => c.ChunkIndex).ToList();
+
+    var top = chunks
+        .Select(c =>
+        {
+            var vec = JsonSerializer.Deserialize<float[]>(c.EmbeddingJson)!;
+            var score = DocPipeline.CosineSimilarity(qVec, vec);
+            return new { c.ChunkIndex, score, c.Text };
+        })
         .OrderByDescending(x => x.score)
         .Take(5)
-        .Select(x => new { chunkIndex = x.i, score = x.score, text = doc.Chunks[x.i] })
-        .ToList();
+        .Select(x => new { chunkIndex = x.ChunkIndex, score = x.score, text = x.Text });
 
     return Results.Ok(top);
 });
 
-app.MapGet("/docs/{docId}/chunks", (string docId) =>
+app.MapGet("/docs/{docId}/chunks", async (string docId, IDocRepository repo, CancellationToken ct) =>
 {
-    if (!DocPipeline.Docs.TryGetValue(docId, out var doc))
-        return Results.NotFound("Unknown docId");
+    var doc = await repo.GetDocumentWithChunksAsync(docId, ct);
+    if (doc == null) return Results.NotFound("Unknown docId");
+
+    var ordered = doc.Chunks.OrderBy(c => c.ChunkIndex).ToList();
 
     return Results.Ok(new
     {
         docId,
         filename = doc.FileName,
-        chunkCount = doc.Chunks.Count,
-        chunks = doc.Chunks.Take(50).Select((c, i) => new { index = i, text = c })
+        chunkCount = ordered.Count,
+        chunks = ordered.Take(50).Select(c => new { index = c.ChunkIndex, text = c.Text })
     });
 });
 
@@ -129,48 +178,58 @@ app.MapPost("/docs/{docId}/ask", async (
     string docId,
     AskRequest req,
     OpenAIEmbeddingsClient embeddingsClient,
-    OpenAIResponsesClient responsesClient) =>
+    OpenAIResponsesClient responsesClient,
+    IDocRepository repo,
+    CancellationToken ct) =>
 {
-    if (!DocPipeline.Docs.TryGetValue(docId, out var doc))
+    var doc = await repo.GetDocumentWithChunksAsync(docId, ct);
+    if (doc == null)
         return Results.NotFound("Unknown docId");
 
     var topK = Math.Clamp(req.TopK, 1, 10);
 
-    // Retrieve
-    var qVec = await embeddingsClient.EmbedAsync(req.Question);
+    // Embed question
+    var qVec = await embeddingsClient.EmbedAsync(req.Question, ct);
 
-    var top = doc.Embeddings
-        .Select((vec, i) => new { i, score = DocPipeline.CosineSimilarity(qVec, vec) })
+    // Score chunks from DB (deserialize embeddings)
+    var scored = doc.Chunks
+        .OrderBy(c => c.ChunkIndex)
+        .Select(c =>
+        {
+            var vec = JsonSerializer.Deserialize<float[]>(c.EmbeddingJson)!;
+            var score = DocPipeline.CosineSimilarity(qVec, vec);
+            return new { chunkIndex = c.ChunkIndex, score, text = c.Text };
+        })
         .OrderByDescending(x => x.score)
         .Take(topK)
         .ToList();
 
-    var context = string.Join("\n\n", top.Select(t =>
-        $"[Chunk {t.i} | score {t.score:F3}]\n{doc.Chunks[t.i]}"));
+    var context = string.Join("\n\n", scored.Select(s =>
+        $"[Chunk {s.chunkIndex}]\n{s.text}"));
 
     // Generate (grounded)
     var system = """
-You are DocMind, a document-grounded assistant.
-Answer ONLY using the provided context.
-If the answer is not in the context, say: "I don't know based on this document."
-When you use facts, cite chunk numbers like [Chunk 0].
-Be concise.
-""";
+        You are DocMind, a document-grounded assistant.
+        Answer ONLY using the provided context.
+        If the answer is not in the context, say: "I don't know based on this document."
+        When you use facts, cite chunk numbers like [Chunk 0].
+        Be concise.
+        """;
 
-    var user = $"""
-Question: {req.Question}
+            var user = $"""
+        Question: {req.Question}
 
-Context:
-{context}
-""";
+        Context:
+        {context}
+        """;
 
-    var answer = await responsesClient.GenerateAsync(system, user);
+    var answer = await responsesClient.GenerateAsync(system, user, ct);
 
     return Results.Ok(new
     {
         docId,
         question = req.Question,
-        topChunks = top.Select(t => new { chunkIndex = t.i, score = t.score }),
+        topChunks = scored.Select(s => new { chunkIndex = s.chunkIndex, score = s.score }),
         answer
     });
 });
