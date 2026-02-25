@@ -229,9 +229,26 @@ app.MapPost("/docs/{docId}/ask", async (
     {
         docId,
         question = req.Question,
-        topChunks = scored.Select(s => new { chunkIndex = s.chunkIndex, score = s.score }),
-        answer
+        answer,
+        sources = scored.Select(s => new
+        {
+            chunkIndex = s.chunkIndex,
+            score = s.score,
+            preview = s.text.Length <= 240 ? s.text : s.text[..240] + "…"
+        })
     });
 });
+
+app.MapGet("/docs", async (IDocRepository repo, CancellationToken ct) =>
+{
+    var docs = await repo.ListDocumentsAsync(ct, take: 25);
+    return Results.Ok(docs.Select(d => new {
+        id = d.Id,
+        filename = d.FileName,
+        createdUtc = d.CreatedUtc,
+        chunkCount = d.Chunks.Count
+    }));
+});
+
 
 app.Run();
